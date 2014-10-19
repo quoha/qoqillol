@@ -31,7 +31,6 @@ typedef long qovmreg;
 // core
 //
 typedef struct qovm {
-    qocell *pc;
     qocell *startOfCore;
     qocell *endOfCode;
     qocell *endOfCore;
@@ -39,10 +38,11 @@ typedef struct qovm {
     int     debugLevel;
     int     maxSteps;
     size_t  coreSize;
-    qovmreg a, b; // register: accumulators
-    qovmreg c;    // program counter
-    qovmreg d;    // computed address of current instruction
-    qovmreg p, g; // index registers
+    qocell  d; // address register; effective address;
+    qocell  p; // index into stack frame (top of program stack)
+    qocell  g; // index into global variable list
+    qocell  a, b; // register: accumulators
+    qocell  c;    // program counter
     qocell  globalVariableStack[512];
     qocell  programCallStack[512];
     qocell  core[1];
@@ -64,27 +64,38 @@ typedef struct qovm {
 // note that with a 16 bit address, core is limited to 65k cells
 //
 #define QOP_RD_FUNC(op) (((op) & 0xf000) >> 12)
-#define QOP_RD_SIZE(op) (((op) & 0x0f00) >>  8)
-#define QOP_RD_IBIT(op) (((op) & 0x0080) >>  7)
-#define QOP_RD_MODG(op) (((op) & 0x0040) >>  6)
-#define QOP_RD_MODP(op) (((op) & 0x0020) >>  5)
-#define QOP_RD_BITS(op) (((op) & 0x001f)      )
+#define QOP_RD_DBIT(op) (((op) & 0x0800) >> 11)
+#define QOP_RD_PBIT(op) (((op) & 0x0200) >> 10)
+#define QOP_RD_GBIT(op) (((op) & 0x0400) >>  9)
+#define QOP_RD_IBIT(op) (((op) & 0x0100) >>  8)
+#define QOP_RD_ADDR(op) (((op) & 0x00ff)      )
 //
 #define QOP_WR_FUNC(op) (((op) & 0x0f  ) << 12)
-#define QOP_WR_SIZE(op) (((op) & 0x0f  ) <<  8)
-#define QOP_WR_IBIT(op) (((op) & 0x08  ) <<  7)
-#define QOP_WR_MODG(op) (((op) & 0x04  ) <<  6)
-#define QOP_WR_MODP(op) (((op) & 0x02  ) <<  5)
-#define QOP_WR_BITS(op) (((op) & 0x1f  )      )
+#define QOP_WR_DBIT(op) (((op) & 0x01  ) << 11)
+#define QOP_WR_PBIT(op) (((op) & 0x01  ) << 10)
+#define QOP_WR_GBIT(op) (((op) & 0x01  ) <<  9)
+#define QOP_WR_IBIT(op) (((op) & 0x01  ) <<  8)
+#define QOP_WR_ADDR(op) (((op) & 0xff  )      )
+
+#define QFNLOAD  0x00
+#define QFNEXOP  0x01
+#define QFNADD   0x02
+#define QFNSTORE 0x03
+#define QFNCALL  0x04
+#define QFNJMP   0x05
+#define QFNJMPT  0x06
+#define QFNJMPF  0x07
+#define QFNDUMP  0x0E
+#define QFNHALT  0x0F
 
 #define qoalloc(x) qo_alloc(__FILE__, __FUNCTION__, __LINE__, (x))
 void *qo_alloc(const char *file, const char *function, int line, size_t size);
 qovm *qovm_alloc(size_t coreSize, int debugLevel, int maxSteps);
 void  qovm_dump(qovm *vm);
-void  qovm_dump_opcode(qovm *vm, qocell *op);
-void  qovm_emit(qovm *vm, qocell op, void *data);
+void  qovm_dump_opcode(qovm *vm, size_t address, qocell op);
+void  qovm_emit_code(qovm *vm, qocell op);
+void  qovm_emit_data(qovm *vm, qocell data);
 void  qovm_exec(qovm *vm);
-int   qovm_hex_to_data_le(const char *startOfHex, size_t length, unsigned char *data);
 void  qovm_load_icode(qovm *vm, const char *code);
 void  qovm_reset(qovm *vm);
 const char *qovm_util_op2mnemonic(qocell op);
@@ -103,16 +114,18 @@ void *qo_alloc(const char *file, const char *function, int line, size_t size) {
 qovm *qovm_alloc(size_t coreSize, int debugLevel, int maxSteps) {
     coreSize = (coreSize < 16) ? 16 : coreSize;
     qovm *vm = qoalloc(sizeof(*vm) + (sizeof(qocell) * coreSize));
-    vm->startOfCore = vm->endOfCode = vm->ip = vm->pc = vm->core;
+    vm->startOfCore = vm->endOfCode = vm->ip = vm->core;
     vm->endOfCore = vm->core + coreSize;
     vm->coreSize = coreSize;
     vm->debugLevel = debugLevel;
     vm->maxSteps = -1;
 
+    vm->a = vm->b = vm->c = vm->d = vm->g = vm->g = 0;
+
     if (vm->debugLevel) {
         int idx;
         for (idx = 0; idx <= coreSize; idx++) {
-            vm->core[idx] = 0xffff;
+            vm->core[idx] = -1;
         }
         vm->maxSteps = maxSteps;
     }
@@ -124,57 +137,56 @@ void qovm_dump(qovm *vm) {
     printf("...vm: ------------------------------------\n");
     printf(".....: vm             %p\n", vm);
     printf(".....: coreSize       %zu\n", vm->coreSize);
-    printf(".....: endOfCode      %ld\n", vm->endOfCode - vm->core);
-    printf(".....: debugLevel     %d\n", vm->debugLevel);
-    printf(".....: startOfCore    %p\n", vm->startOfCore);
-    printf(".....: programCounter %p  %8ld\n", vm->pc, vm->pc - vm->startOfCore);
-    printf(".....: endOfCore      %p\n", vm->endOfCore);
+//    printf(".....: endOfCode      %ld\n", vm->endOfCode - vm->core);
+//    printf(".....: debugLevel     %d\n", vm->debugLevel);
+//    printf(".....: startOfCore    %p\n", vm->startOfCore);
+    printf(".....: programCounter %8d\n", vm->c);
+//    printf(".....: endOfCore      %p\n", vm->endOfCore);
+    printf(".....: c              %04x\n", vm->c);
+    printf(".....: d              %04x\n", vm->d);
+    printf(".....: a              %04x\n", vm->a);
+    printf(".....: b              %04x\n", vm->b);
+    printf(".....: p              %04x\n", vm->p);
+    printf(".....: g              %04x\n", vm->g);
 }
 
-void qovm_dump_opcode(qovm *vm, qocell *op) {
+void qovm_dump_opcode(qovm *vm, size_t address, qocell op) {
     printf("...vm: ------------------------------------\n");
-    printf(".....: address        %zu\n", op - vm->core);
-    printf(".....: op             0x%04x\n", *op);
-    printf(".....: ...function    0x%04x %s\n", QOP_RD_FUNC(*op), qovm_util_op2mnemonic(QOP_RD_FUNC(*op)));
-    printf(".....: ...opSize      0x%04x (cells, not bytes)\n", QOP_RD_SIZE(*op));
-    printf(".....: ...indirection 0x%04x\n", QOP_RD_IBIT(*op));
-    printf(".....: ...gIndexMod   0x%04x\n", QOP_RD_MODG(*op));
-    printf(".....: ...pIndexMod   0x%04x\n", QOP_RD_MODP(*op));
-    printf(".....: ...unusedBits  0x%04x\n", QOP_RD_BITS(*op));
-
-    int idx;
-    for (idx = 1; idx <= QOP_RD_SIZE(*op); idx++) {
-        printf(".....: ......operand  0x%04x\n", op[idx]);
-    }
+    printf(".....: address        %zu\n", address);
+    printf(".....: op.function    0x%04x %s\n", QOP_RD_FUNC(op), qovm_util_op2mnemonic(QOP_RD_FUNC(op)));
+    printf(".....: ...dpgi addr   %c%c%c%c %02x %4d\n", QOP_RD_DBIT(op) ? 'D':'d', QOP_RD_PBIT(op) ? 'P':'p', QOP_RD_GBIT(op) ? 'G':'g', QOP_RD_IBIT(op) ? 'I':'i', QOP_RD_ADDR(op), (int)(QOP_RD_ADDR(op)));
 }
 
-void qovm_emit(qovm *vm, qocell op, void *data) {
-    int bytesToCopy = QOP_RD_SIZE(op);
-
+void qovm_emit_code(qovm *vm, qocell op) {
     // verify that we have space in the core
     //
-    if (!(vm->core <= vm->endOfCode && vm->endOfCode + bytesToCopy < vm->endOfCore)) {
+    if (!(vm->core <= vm->endOfCode && vm->endOfCode < vm->endOfCore)) {
         printf("error: %s %d\n\tcode segment out of range\n", __FUNCTION__, __LINE__);
         qovm_dump(vm);
         exit(2);
     }
-    printf(".info: iemit(pc %8ld => 0x%04x)\n", vm->endOfCode - vm->core, op);
 
+    printf(".info: emitc(pc %8ld => 0x%04x)\n", vm->endOfCode - vm->core, op);
+    
     // emit the instruction
     //
     *(vm->endOfCode++) = op;
+}
 
-    // TODO: emit any data attached to the instruction
+void qovm_emit_data(qovm *vm, qocell data) {
+    // verify that we have space in the core
     //
-    // the instruction may span multiple cells.
-    // bump the program counter to account for that.
-    //
-    if (bytesToCopy) {
-        qocell *cell = data;
-        while (bytesToCopy-- > 0) {
-            *(vm->endOfCode++) = *(cell++);
-        }
+    if (!(vm->core <= vm->endOfCode && vm->endOfCode < vm->endOfCore)) {
+        printf("error: %s %d\n\tdata segment out of range\n", __FUNCTION__, __LINE__);
+        qovm_dump(vm);
+        exit(2);
     }
+
+    printf(".info: emitd(pc %8ld => 0x%04x)\n", vm->endOfCode - vm->core, data);
+    
+    // emit the instruction
+    //
+    *(vm->endOfCode++) = data;
 }
 
 // An instruction is executed as follows.
@@ -193,80 +205,119 @@ void qovm_exec(qovm *vm) {
 
     // verify that we're executing steps in the core
     //
-    if (!(vm->core <= vm->pc && vm->pc < vm->endOfCore)) {
+    if (!(0 <= vm->c && vm->c < vm->coreSize)) {
         printf("error: %s %d\n\tprogram counter out of range\n", __FUNCTION__, __LINE__);
         qovm_dump(vm);
         exit(2);
     }
 
-    qovm_dump_opcode(vm, vm->pc);
+    qovm_dump_opcode(vm, vm->c, vm->core[vm->c]);
 
     // fetch the instruction from core
-    qocell  code    = *(vm->pc++);
-    qocell *operand = vm->pc;
-    qocell *address = 0;
+    qocell code     = vm->core[vm->c++];
+    qocell function = QOP_RD_FUNC(code);
+    qocell dBit     = QOP_RD_DBIT(code);
+    qocell pBit     = QOP_RD_PBIT(code);
+    qocell gBit     = QOP_RD_GBIT(code);
+    qocell iBit     = QOP_RD_IBIT(code);
+    qocell addrBits = QOP_RD_ADDR(code);
 
-    qocell opSize            = QOP_RD_SIZE(code);
-    qocell function          = QOP_RD_FUNC(code);
-    qocell indirectionBit    = QOP_RD_IBIT(code);
-    qocell gIndexModBit      = QOP_RD_MODG(code);
-    qocell pIndexModBit      = QOP_RD_MODP(code);
-    qocell unusedBits        = QOP_RD_BITS(code);
-
-    // the instruction may span multiple cells. the cells store data for the
-    // particular instruction. bump the program counter to account for that.
+    // if the D bit is set, the address is the value of the next cell.
+    // other wise, it is just the program counter plus the address offset.
     //
-    vm->pc += opSize;
-}
-
-// should understand endianness. this version is little-endian:
-//
-//   0x0102030405060708  ==>  0x0807060504030201
-//
-int qovm_hex_to_data_le(const char *hex, size_t length, unsigned char *data) {
-    size_t maxLength = 15 * sizeof(qocell);
-    if (length > maxLength) {
-        printf("error: hex data must not exceed 15 cells/(%zu bytes)\n", maxLength);
-        exit(2);
+    if (dBit) {
+        vm->d = vm->core[vm->c++];
+    } else {
+        vm->d = vm->c + addrBits;
     }
 
-//    const char *c = hex + length - 1;
-//    int idx;
-//    for (idx = 0; idx < maxLength; idx++) {
-//        data[idx] = 0;
-//        if (c >= hex) {
-//            data[idx] = *c - (isdigit(*c) ? '0' : 'A');
-//            c--;
-//            if (c >= hex) {
-//                data[idx] = (data[idx] << 4) ^ (*c - (isdigit(*c) ? '0' : 'A'));
-//                c--;
-//            }
-//        }
-//    }
+    // second step of address calculation
+    // if the P bit is set, the P register is added to D
+    //
+    if (pBit) {
+        vm->d += vm->p;
+    }
 
-    int opSize = 0;
-//    for (idx = 1; idx < 15; idx++) {
-//        if (idx  * sizeof(qocell) <= length) {
-//            opSize++;
-//        } else {
-//            break;
-//        }
-//    }
+    // third stage of address calculation
+    // if the G bit is set, the G register is added to D
+    //
+    if (gBit) {
+        vm->d += vm->g;
+    }
+    
+    // last stage of address calculation
+    // if the I bit is set, the D register is an indirect reference
+    //
+    if (iBit) {
+        if (vm->d > vm->coreSize) {
+            printf("error: %s %d\n\tindirect address out of range\n", __FUNCTION__, __LINE__);
+            qovm_dump(vm);
+            exit(2);
+        }
+        vm->d = vm->core[vm->d];
+    }
 
-    return opSize;
+    switch (function) {
+        case QFNADD:
+            vm->a += vm->d;
+            break;
+        case QFNCALL:
+            vm->d += vm->p;
+            vm->core[vm->d] = vm->p;
+            vm->core[vm->d + 1] = vm->c;
+            vm->p = vm->d;
+            vm->c = vm->a;
+            break;
+        case QFNDUMP:
+            qovm_dump(vm);
+            break;
+        case QFNEXOP:
+            printf(".warn: exop not implemented\n");
+            break;
+        case QFNHALT:
+            printf(".halt: halting....\n");
+            break;
+        case QFNJMP:
+            vm->c = vm->d;
+            break;
+        case QFNJMPF:
+            if (!vm->a) {
+                vm->c = vm->d;
+            }
+            break;
+        case QFNJMPT:
+            if (vm->a) {
+                vm->c = vm->d;
+            }
+            break;
+        case QFNLOAD:
+            vm->b = vm->a;
+            vm->a = vm->d;
+            break;
+        case QFNSTORE:
+            if (vm->d > vm->coreSize) {
+                printf("error: %s %d\n\taddress out of range\n", __FUNCTION__, __LINE__);
+                qovm_dump(vm);
+                exit(2);
+            }
+            vm->core[vm->d] = vm->a;
+            break;
+        default:
+            printf("error:\t%s %d\nerror: unknown function 0x%02x\n", __FUNCTION__, __LINE__, function);
+            exit(2);
+    }
 }
 
 void  qovm_load_icode(qovm *vm, const char *code) {
     printf(".code: %s\n", code);
     unsigned char function     = 0;
-    int           indirectBit  = 0;
-    int           gIndexModBit = 0;
-    int           pIndexModBit = 0;
+    unsigned char dBit         = 0;
+    unsigned char pBit         = 0;
+    unsigned char gBit         = 0;
+    unsigned char iBit         = 0;
+    unsigned char oBits        = 0;
     const char   *mnemonic     = 0;
-    int           numNibs      = 0;
-    qocell        opSize       = 0;
     qocell        op;
-    unsigned char  data[16 * sizeof(qocell)];
 
     while (*code && vm->endOfCode < vm->endOfCore) {
         if (isspace(*code)) {
@@ -274,7 +325,9 @@ void  qovm_load_icode(qovm *vm, const char *code) {
                 code++;
             }
             continue;
-        } else if (*code == ';') {
+        }
+        
+        if (*code == ';') {
             // comment to the end of the line
             while (*code && !(*code == '\n')) {
                 code++;
@@ -284,57 +337,64 @@ void  qovm_load_icode(qovm *vm, const char *code) {
             }
         }
 
-        const char *startOfHex = code;
-        while (*code == '0' || *code == '1' || *code == '2' || *code == '3' || *code == '4' || *code == '5' || *code == '6' || *code == '7' || *code == '8' || *code == '9' || *code == 'A' || *code == 'B' || *code == 'C' || *code == 'D' || *code == 'E' || *code == 'F') {
-            code++;
-        }
-        const char *endOfHex = code;
-
-        switch (*code) {
-            case 'i': indirectBit  = 0x01; break;
-            case 'g': gIndexModBit = 0x01; break;
-            case 'p': pIndexModBit = 0x01; break;
-            case 'l': function = 0x00; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 'x': function = 0x01; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 'a': function = 0x02; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 's': function = 0x03; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 'k': function = 0x04; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 'j': function = 0x05; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 't': function = 0x06; mnemonic = qovm_util_op2mnemonic(function); break;
-            case 'f': function = 0x07; mnemonic = qovm_util_op2mnemonic(function); break;
-            default: // ignore all unknown input
-                break;
-        }
-
-        if (mnemonic) {
-            // opSize is the number of cells of data needed.
-            //
-            opSize = qovm_hex_to_data_le(startOfHex, endOfHex - startOfHex, data);
-
-            op  = QOP_WR_FUNC(function);
-            op ^= QOP_WR_SIZE(opSize);
-            op ^= QOP_WR_IBIT(indirectBit);
-            op ^= QOP_WR_MODG(indirectBit);
-            op ^= QOP_WR_MODP(indirectBit);
-
-            printf(".info: icode(%-5s 0x%04x %2d)\n", mnemonic, op, opSize);
-            if (opSize) {
-                int idx;
-                for (idx = 0; idx < opSize; idx++) {
-                    printf(".....: .........data 0x%02x\n", data[idx]);
+        if (isdigit(*code) || ('A' <= *code && *code <= 'F')) {
+            unsigned long number = 0;
+            do {
+                if (isdigit(*code)) {
+                    number = (number << 4) + (*(code++) - '0');
+                } else if ('A' <= *code && *code <= 'F') {
+                    number = (number << 4) + (*(code++) - 'A' + 10);
+                } else {
+                    break;
                 }
-            }
-            qovm_emit(vm, op, data);
+            } while (*code);
+
+            op  = (qocell)number;
+            qovm_emit_data(vm, op);
 
             // reset everything to prepare for the next instruction
             //
             function = 0;
             mnemonic = 0;
-            numNibs  = 0;
-            opSize   = 0;
-            indirectBit = gIndexModBit = pIndexModBit = 0;
+            dBit = pBit = gBit = iBit = oBits = 0;
+
+            continue;
         }
-        code++;
+
+        switch (*(code++)) {
+            case 'a': function = QFNADD  ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'k': function = QFNCALL ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'f': function = QFNJMPF ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'h': function = QFNHALT ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'j': function = QFNJMP  ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'l': function = QFNLOAD ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'q': function = QFNDUMP ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 's': function = QFNSTORE; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 't': function = QFNJMPT ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'x': function = QFNEXOP ; mnemonic = qovm_util_op2mnemonic(function); break;
+            case 'd': dBit = 0x01; break;
+            case 'i': iBit = 0x01; break;
+            case 'g': gBit = 0x01; break;
+            case 'p': pBit = 0x01; break;
+                break;
+            default: // ignore all unknown input
+                break;
+        }
+
+        if (mnemonic) {
+            op  = QOP_WR_FUNC(function);
+            op ^= QOP_WR_DBIT(dBit);
+            op ^= QOP_WR_PBIT(pBit);
+            op ^= QOP_WR_GBIT(gBit);
+            op ^= QOP_WR_IBIT(iBit);
+            qovm_emit_code(vm, op);
+
+            // reset everything to prepare for the next instruction
+            //
+            function = 0;
+            mnemonic = 0;
+            dBit = pBit = gBit = iBit = oBits = 0;
+        }
     }
     if (*code) {
         printf("error:\t%s %d\nerror: out of core memory\n", __FUNCTION__, __LINE__);
@@ -343,7 +403,7 @@ void  qovm_load_icode(qovm *vm, const char *code) {
 }
 
 void qovm_reset(qovm *vm) {
-    vm->pc = vm->core;
+    vm->a = vm->b = vm->c = vm->d = vm->g = vm->g = 0;
 }
 
 // op bits hex function
@@ -358,16 +418,18 @@ void qovm_reset(qovm *vm) {
 //
 const char *qovm_util_op2mnemonic(qocell op) {
     switch (op) {
-        case 0x00: return "load";
-        case 0x01: return "exop";
-        case 0x02: return "add";
-        case 0x03: return "store";
-        case 0x04: return "call";
-        case 0x05: return "jmp";
-        case 0x06: return "jmpt";
-        case 0x07: return "jmpf";
+        case QFNADD: return "add";
+        case QFNCALL: return "call";
+        case QFNDUMP: return "dump";
+        case QFNEXOP: return "exop";
+        case QFNHALT: return "halt";
+        case QFNJMP: return "jmp";
+        case QFNJMPF: return "jmpf";
+        case QFNJMPT: return "jmpt";
+        case QFNLOAD: return "load";
+        case QFNSTORE: return "store";
     }
-    printf("error:\t%s %d\nerror: unknown function 0x%04x\n", __FUNCTION__, __LINE__, QOP_RD_FUNC(op));
+    printf("error:\t%s %d\nerror: unknown function 0x%02x\n", __FUNCTION__, __LINE__, op);
     exit(2);
     /* NOT REACHED */
     return "unknown";
@@ -384,24 +446,13 @@ int main(int argc, const char * argv[]) {
     printf(".info: sizeof(pointer  ) %3lu bytes\n", sizeof(void *   ));
     printf(".info: sizeof(qocellr  ) %3lu bytes\n", sizeof(qocell   ));
 
-    union {
-        unsigned char data[sizeof(unsigned long)];
-        unsigned long number;
-    } u;
-    u.number = 0x0102030405060708L;
-    int idx;
-    printf(".info: unsigned long 0x%016lx ", u.number);
-    for (idx = 0; idx < sizeof(unsigned long); idx++) {
-        printf(" %02x", u.data[idx]);
-    }
-    printf("\n");
-    qovm *vm = qovm_alloc(16 * 1024, 10, 8);
+    qovm *vm = qovm_alloc(64 * 1024, 10, 8);
     qovm_dump(vm);
 
-    qovm_load_icode(vm, "1234l 00px EEga FFpgs AAk DEADBEEFCAFEF00Dj CAFE t DDDDf FFl 1913l ; comments welcome");
+    qovm_load_icode(vm, "q da 1234 q h gpil px ga pgs k j t f l l 1234 DEAD BEEF ; comments welcome");
     //qovm_dump(vm);
 
-    //int idx;
+    int idx;
     for (idx = 0; idx < 100; idx++) {
         qovm_exec(vm);
     }
